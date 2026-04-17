@@ -56,6 +56,21 @@ export interface FileWithMetadata extends FileRecord {
   metadata?: FileMetadataEntry;
 }
 
+export type TelemetryEventType = "retry" | "conflict" | "throttle";
+
+export interface TelemetryEvent {
+  type: TelemetryEventType;
+  source: string;
+  provider?: ProviderName;
+  attempt?: number;
+  message?: string;
+  timestamp: string;
+}
+
+export interface TelemetryHook {
+  onEvent?: (event: TelemetryEvent) => void;
+}
+
 export type ChangeType = "added" | "updated" | "removed";
 
 export interface ChangeEvent {
@@ -74,8 +89,14 @@ export interface ProviderAdapter {
   listFiles(folderId: string): Promise<FileRecord[]>;
   getFileContent(folderId: string, name: string): Promise<string | null>;
   upsertFile(folderId: string, name: string, content: string | Buffer, mimeType?: string): Promise<FileRecord>;
+  deleteFile(folderId: string, name: string): Promise<boolean>;
   getInitialSyncToken(folderId: string): Promise<string | undefined>;
   getIncrementalChanges(folderId: string, syncToken?: string): Promise<{ events: ChangeEvent[]; syncToken?: string }>;
+}
+
+export interface TableDBOptions {
+  namespace?: string;
+  telemetry?: TelemetryHook;
 }
 
 export interface CacheStore {
@@ -102,4 +123,5 @@ export interface FileBaseDBOptions {
     maxRetries?: number;
     backoffMs?: number;
   };
+  telemetry?: TelemetryHook;
 }

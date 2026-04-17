@@ -32,6 +32,7 @@ export class FileBaseDB {
   private readonly writeConflictPolicy: "retry-merge" | "fail-fast";
   private readonly writeConflictMaxRetries: number;
   private readonly writeConflictBackoffMs: number;
+  private readonly telemetry?: FileBaseDBOptions["telemetry"];
 
   private folderId?: string;
   private metadataManager?: MetadataManager;
@@ -49,6 +50,7 @@ export class FileBaseDB {
     this.writeConflictPolicy = options?.writeConflict?.policy ?? "retry-merge";
     this.writeConflictMaxRetries = options?.writeConflict?.maxRetries ?? 3;
     this.writeConflictBackoffMs = options?.writeConflict?.backoffMs ?? 120;
+    this.telemetry = options?.telemetry;
     this.cache = options?.useSQLiteCache ? new SQLiteCache(options?.sqliteDbPath) : new InMemoryCache();
   }
 
@@ -81,7 +83,8 @@ export class FileBaseDB {
         policy: this.writeConflictPolicy,
         maxRetries: this.writeConflictMaxRetries,
         backoffMs: this.writeConflictBackoffMs,
-      }
+      },
+      this.telemetry
     );
     const initialSyncToken = await this.provider.getInitialSyncToken(resolvedFolderId);
     if (initialSyncToken) {
@@ -137,6 +140,11 @@ export class FileBaseDB {
   async writeFile(name: string, content: string | Buffer, mimeType = "text/plain"): Promise<FileRecord> {
     const folderId = this.requireFolderId();
     return this.provider.upsertFile(folderId, name, content, mimeType);
+  }
+
+  async deleteFile(name: string): Promise<boolean> {
+    const folderId = this.requireFolderId();
+    return this.provider.deleteFile(folderId, name);
   }
 
   /**
@@ -251,11 +259,11 @@ function createProvider(
 ): ProviderAdapter {
   const retryOptions = withRetryDefaults(options?.retry);
   if (provider === "google") {
-    return new GoogleDriveProvider(retryOptions);
+    return new GoogleDriveProvider(retryOptions, options?.telemetry);
   }
 
   if (provider === "onedrive") {
-    return new OneDriveProvider(retryOptions);
+    return new OneDriveProvider(retryOptions, options?.telemetry);
   }
 
   throw new ConfigurationError(`Unsupported provider: ${provider}`);

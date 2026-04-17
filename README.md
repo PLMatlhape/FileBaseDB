@@ -19,13 +19,15 @@ Ready now:
 - Metadata indexing and filtering
 - Incremental sync subscriptions
 - Local caching (memory and SQLite option)
+- Built-in retry/backoff for transient provider failures
+- Conflict-aware metadata and table operations
+- Telemetry hooks for retry/throttle/conflict events
 - Typed error model
 - Secret redaction in key error paths
 - CI build/test/security workflow support
 
 Still recommended before high-scale or mission-critical use:
 
-- App-level retry/backoff policy for provider throttling
 - Integration tests in your own environment and quotas
 - Concurrency strategy for competing writes
 - Operational monitoring around provider/API failures
@@ -116,6 +118,45 @@ await tables.insert("products", {
 });
 ```
 
+Advanced SQL mapper example (namespace + telemetry + table file listing + layout migration):
+
+```ts
+import { connect, createTableDB, migrateTableLayout } from "filebasedb";
+
+const db = await connect("onedrive", credentials, {
+  telemetry: {
+    onEvent: (event) => {
+      console.log("[filebasedb]", event.type, event.source, event.message);
+    },
+  },
+});
+
+await db.useFolder(folderId);
+
+const tenantTables = await createTableDB(db, {
+  namespace: "tenant-a",
+  telemetry: {
+    onEvent: (event) => {
+      if (event.type === "conflict") {
+        console.warn("Conflict event", event);
+      }
+    },
+  },
+});
+
+await tenantTables.createTable({
+  tableName: "orders",
+  columns: {
+    id: { type: "string" },
+    total: { type: "number" },
+  },
+  primaryKey: "id",
+});
+
+const files = await tenantTables.listTableFiles("orders");
+await migrateTableLayout(db, { namespace: "tenant-a" });
+```
+
 ## Image storage and rendering
 
 FileBaseDB can store binary files (including images) in provider folders and return metadata that apps can render.
@@ -136,8 +177,11 @@ Important: FileBaseDB does not render images itself.
 - removeMetadata(fileId)
 - writeFile(name, content, mimeType?)
 - readFile(name)
+- deleteFile(name)
 - subscribe(folderId, callback)
 - disconnect()
+- createTableDB(db, options?)
+- migrateTableLayout(db, options?)
 
 ## Required scopes
 
@@ -159,6 +203,12 @@ connect options:
 - sqliteDbPath
 - retry.maxAttempts/baseDelayMs/maxDelayMs/jitterRatio
 - writeConflict.policy/maxRetries/backoffMs
+- telemetry.onEvent(event)
+
+SQL mapper options:
+
+- namespace
+- telemetry.onEvent(event)
 
 ## Limitations
 
@@ -167,6 +217,36 @@ connect options:
 - Query performance depends on provider API and folder size
 - No built-in RBAC beyond provider permissions
 - High-concurrency write coordination is app responsibility
+
+## When to use vs when not to use
+
+| Scenario | Fit |
+| --- | --- |
+| Data already lives in Drive/OneDrive folders | Strong |
+| File-centric apps with metadata filtering | Strong |
+| Internal tools and moderate traffic workloads | Strong |
+| Complex relational joins/analytics workloads | Weak |
+| Strict multi-record transactions (ACID) required | Weak |
+| Very high write concurrency across many workers | Weak |
+
+## Production readiness guidance
+
+Practical readiness: **8/10** for lightweight-to-moderate production workloads.
+
+Ready now:
+
+- Retry with backoff/jitter for transient provider failures
+- Conflict-aware metadata and table updates
+- Telemetry hooks for retry/throttle/conflict events
+- Incremental sync subscriptions and metadata indexing
+- Namespaced SQL mapper layout and table layout migration helper
+
+Recommended before high-scale, mission-critical workloads:
+
+- Define SLOs, alerts, and dashboards around provider/API failure rates
+- Run smoke tests in target tenant with real quotas and auth flow
+- Add app-level strategy for hot-row contention and idempotency
+- Validate backup/restore process for target provider folders
 
 ## Testing and release checks
 

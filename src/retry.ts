@@ -1,10 +1,17 @@
 import { safeErrorMessage } from "./security";
+import { TelemetryHook } from "./types";
 
 export interface RetryOptions {
   maxAttempts: number;
   baseDelayMs: number;
   maxDelayMs: number;
   jitterRatio: number;
+}
+
+export interface RetryContext {
+  source: string;
+  telemetry?: TelemetryHook;
+  provider?: "google" | "onedrive";
 }
 
 export const DEFAULT_RETRY_OPTIONS: RetryOptions = {
@@ -24,8 +31,12 @@ export function withRetryDefaults(options?: Partial<RetryOptions>): RetryOptions
 export async function runWithRetry<T>(
   task: () => Promise<T>,
   options: RetryOptions,
-  shouldRetry: (error: unknown) => boolean
+  shouldRetry: (error: unknown) => boolean,
+  context?: RetryContext
 ): Promise<T> {
+  const source = context?.source ?? "provider";
+  const provider = context?.provider;
+
   let attempt = 0;
   let lastError: unknown;
 
@@ -35,10 +46,32 @@ export async function runWithRetry<T>(
       return await task();
     } catch (error) {
       lastError = error;
+
+      if (isThrottleLikeError(error)) {
+        const throttleEvent = {
+          type: "throttle" as const,
+          source,
+          message: safeErrorMessage(error, "Provider throttling detected."),
+          timestamp: new Date().toISOString(),
+          ...(provider ? { provider } : {}),
+        };
+        context?.telemetry?.onEvent?.(throttleEvent);
+      }
+
       const retryable = shouldRetry(error);
       if (!retryable || attempt >= options.maxAttempts) {
         throw error;
       }
+
+      const retryEvent = {
+        type: "retry" as const,
+        source,
+        attempt,
+        message: safeErrorMessage(error, "Retrying transient provider failure."),
+        timestamp: new Date().toISOString(),
+        ...(provider ? { provider } : {}),
+      };
+      context?.telemetry?.onEvent?.(retryEvent);
 
       const delayMs = computeDelay(attempt, options);
       await sleep(delayMs);
@@ -67,6 +100,16 @@ export function isTransientProviderError(error: unknown): boolean {
     message.includes("etimedout") ||
     message.includes("network") ||
     message.includes("socket hang up")
+  );
+}
+
+export function isThrottleLikeError(error: unknown): boolean {
+  const message = safeErrorMessage(error, "").toLowerCase();
+  return (
+    /\b429\b/.test(message) ||
+    message.includes("too many requests") ||
+    message.includes("rate limit") ||
+    message.includes("throttl")
   );
 }
 

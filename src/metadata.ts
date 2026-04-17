@@ -8,6 +8,7 @@ import {
   FileWithMetadata,
   MetadataDocument,
   ProviderAdapter,
+  TelemetryHook,
 } from "./types";
 
 const METADATA_FILE_NAME = "metadata.json";
@@ -37,6 +38,7 @@ export class MetadataManager {
   private readonly cache: CacheStore;
   private readonly cacheTtlMs: number;
   private readonly writeConflict: WriteConflictOptions;
+  private readonly telemetry: TelemetryHook | undefined;
   private writeChain: Promise<void> = Promise.resolve();
 
   constructor(
@@ -44,13 +46,15 @@ export class MetadataManager {
     folderId: string,
     cache: CacheStore,
     cacheTtlMs: number,
-    writeConflict: WriteConflictOptions
+    writeConflict: WriteConflictOptions,
+    telemetry?: TelemetryHook
   ) {
     this.provider = provider;
     this.folderId = folderId;
     this.cache = cache;
     this.cacheTtlMs = cacheTtlMs;
     this.writeConflict = writeConflict;
+    this.telemetry = telemetry;
   }
 
   private get cacheKey(): string {
@@ -336,6 +340,13 @@ export class MetadataManager {
       const latestRevision = latest.revision ?? 0;
       const conflict = latestRevision !== baseRevision || latest.updatedAt !== baseUpdatedAt;
       if (conflict) {
+        this.telemetry?.onEvent?.({
+          type: "conflict",
+          source: "metadata.commit",
+          message: `Conflict while ${operationLabel}. revision ${baseRevision} -> ${latestRevision}.`,
+          timestamp: new Date().toISOString(),
+        });
+
         if (this.writeConflict.policy === "fail-fast") {
           throw new WriteConflictError(
             `Write conflict detected while attempting to ${operationLabel}. Current revision changed from ${baseRevision} to ${latestRevision}.`
@@ -349,6 +360,13 @@ export class MetadataManager {
         }
 
         await sleep(this.writeConflict.backoffMs * attempt);
+        this.telemetry?.onEvent?.({
+          type: "retry",
+          source: "metadata.commit",
+          attempt,
+          message: `Retrying ${operationLabel} after conflict.`,
+          timestamp: new Date().toISOString(),
+        });
         continue;
       }
 
@@ -357,6 +375,13 @@ export class MetadataManager {
       const confirmed = await this.load(true);
       const confirmedRevision = confirmed.revision ?? 0;
       if (confirmedRevision !== draft.revision) {
+        this.telemetry?.onEvent?.({
+          type: "conflict",
+          source: "metadata.postSaveCheck",
+          message: `Post-save revision mismatch while ${operationLabel}. expected ${draft.revision}, got ${confirmedRevision}.`,
+          timestamp: new Date().toISOString(),
+        });
+
         if (this.writeConflict.policy === "fail-fast" || attempt >= attempts) {
           throw new WriteConflictError(
             `Write conflict detected after save while attempting to ${operationLabel}. Expected revision ${draft.revision}, got ${confirmedRevision}.`
@@ -364,6 +389,13 @@ export class MetadataManager {
         }
 
         await sleep(this.writeConflict.backoffMs * attempt);
+        this.telemetry?.onEvent?.({
+          type: "retry",
+          source: "metadata.postSaveCheck",
+          attempt,
+          message: `Retrying ${operationLabel} after post-save revision mismatch.`,
+          timestamp: new Date().toISOString(),
+        });
         continue;
       }
 

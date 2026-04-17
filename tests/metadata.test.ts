@@ -40,6 +40,11 @@ class MockProvider implements ProviderAdapter {
     return { id: key, name };
   }
 
+  async deleteFile(folderId: string, name: string): Promise<boolean> {
+    const key = `${folderId}/${name}`;
+    return this.store.delete(key);
+  }
+
   async getInitialSyncToken(_folderId: string): Promise<string | undefined> {
     return undefined;
   }

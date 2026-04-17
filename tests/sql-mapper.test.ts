@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert";
-import { createFileBaseDB, createTableDB, ProviderAdapter, FileRecord } from "../src";
+import { createFileBaseDB, createTableDB, migrateTableLayout, ProviderAdapter, FileRecord } from "../src";
 import { ConfigurationError } from "../src/errors";
 
 class MockProvider implements ProviderAdapter {
@@ -29,6 +29,10 @@ class MockProvider implements ProviderAdapter {
   async upsertFile(_: string, name: string, content: string | Buffer): Promise<FileRecord> {
     this.files.set(name, typeof content === "string" ? content : content.toString("utf8"));
     return { id: name, name, mimeType: "application/json" };
+  }
+
+  async deleteFile(_: string, name: string): Promise<boolean> {
+    return this.files.delete(name);
   }
 
   async getInitialSyncToken(): Promise<string | undefined> {
@@ -149,4 +153,67 @@ test("SQL mapper rejects invalid records", async () => {
   } finally {
     db.disconnect();
   }
+});
+
+test("SQL mapper supports namespaced table folders and listTableFiles", async () => {
+  const provider = new MockProvider();
+  const db = createFileBaseDB("google", provider, { cacheTtlMs: 1000 });
+  await db.useFolder("test-folder");
+  const tables = await createTableDB(db, { namespace: "tenant-a" });
+
+  try {
+    await tables.createTable({
+      tableName: "users",
+      columns: {
+        id: { type: "string" },
+        name: { type: "string" },
+      },
+      primaryKey: "id",
+    });
+
+    await tables.insert("users", { id: "u1", name: "John" });
+    const files = await tables.listTableFiles("users");
+
+    assert.ok(files.includes("tenant-a/users/_schema.json"));
+    assert.ok(files.includes("tenant-a/users/_index.json"));
+    assert.ok(files.some((file) => file.endsWith("/users-u1.json")));
+  } finally {
+    db.disconnect();
+  }
+});
+
+test("SQL mapper migrates legacy root schema and index layout", async () => {
+  const provider = new MockProvider();
+  const db = createFileBaseDB("google", provider, { cacheTtlMs: 1000 });
+  await db.useFolder("test-folder");
+
+  const schemaJson = JSON.stringify({
+    tableName: "products",
+    columns: {
+      id: { type: "string" },
+    },
+    primaryKey: "id",
+  });
+
+  const indexJson = JSON.stringify({
+    tableName: "products",
+    primaryKey: "id",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    records: {},
+    fieldValues: { id: {} },
+  });
+
+  await db.writeFile("products.schema.json", schemaJson, "application/json");
+  await db.writeFile("products.index.json", indexJson, "application/json");
+
+  const result = await migrateTableLayout(db);
+
+  assert.deepStrictEqual(result.migratedTables, ["products"]);
+  assert.equal(await db.readFile("products/_schema.json"), schemaJson);
+  assert.equal(await db.readFile("products/_index.json"), indexJson);
+  assert.equal(await db.readFile("products.schema.json"), null);
+  assert.equal(await db.readFile("products.index.json"), null);
+
+  db.disconnect();
 });

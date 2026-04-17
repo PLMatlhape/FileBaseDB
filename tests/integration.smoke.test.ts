@@ -101,7 +101,47 @@ test("integration smoke: OAuth provider, folder access, read/write, metadata", {
     assert.ok(tagged.some((entry) => entry.id === written.id));
 
     await db.removeMetadata(written.id);
+    await db.deleteFile(smokeFileName);
   } finally {
+    db.disconnect();
+  }
+});
+
+test("integration smoke: provider creates real folder hierarchy for nested paths", { timeout: 120_000 }, async (t) => {
+  if (!SMOKE_ENABLED) {
+    t.skip("Set FILEBASEDB_SMOKE_TEST=1 to run integration smoke tests.");
+    return;
+  }
+
+  const provider = getProvider();
+  const folderId = getFolderId();
+  const credentials = getCredentials(provider);
+  const db = await connect(provider, credentials, {
+    retry: {
+      maxAttempts: 5,
+      baseDelayMs: 250,
+      maxDelayMs: 4_000,
+    },
+  });
+
+  const suffix = `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  const pathA = `hierarchy/a-${suffix}/shared-name.txt`;
+  const pathB = `hierarchy/b-${suffix}/shared-name.txt`;
+
+  try {
+    await db.useFolder(folderId);
+
+    await db.writeFile(pathA, `A-${suffix}`, "text/plain");
+    await db.writeFile(pathB, `B-${suffix}`, "text/plain");
+
+    const readA = await db.readFile(pathA);
+    const readB = await db.readFile(pathB);
+
+    assert.equal(readA, `A-${suffix}`);
+    assert.equal(readB, `B-${suffix}`);
+  } finally {
+    await db.deleteFile(pathA);
+    await db.deleteFile(pathB);
     db.disconnect();
   }
 });

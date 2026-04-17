@@ -3,7 +3,7 @@ import { Client } from "@microsoft/microsoft-graph-client";
 import { AuthenticationError, ProviderError } from "./errors";
 import { isTransientProviderError, RetryOptions, runWithRetry, withRetryDefaults } from "./retry";
 import { safeErrorMessage, redactSecrets } from "./security";
-import { ChangeEvent, OneDriveOAuthCredentials, ProviderAdapter, ProviderCredentials, FileRecord } from "./types";
+import { ChangeEvent, OneDriveOAuthCredentials, ProviderAdapter, ProviderCredentials, FileRecord, TelemetryHook } from "./types";
 
 type GraphItem = {
   id?: string;
@@ -43,9 +43,11 @@ export class OneDriveProvider implements ProviderAdapter {
   private graphClient?: Client;
   private accessToken?: string;
   private readonly retryOptions: RetryOptions;
+  private readonly telemetry: TelemetryHook | undefined;
 
-  constructor(retryOptions?: Partial<RetryOptions>) {
+  constructor(retryOptions?: Partial<RetryOptions>, telemetry?: TelemetryHook) {
     this.retryOptions = withRetryDefaults(retryOptions);
+    this.telemetry = telemetry;
   }
 
   async initialize(credentials: ProviderCredentials): Promise<void> {
@@ -87,7 +89,7 @@ export class OneDriveProvider implements ProviderAdapter {
           .api(`/me/drive/items/${encodeURIComponent(folderId)}/children`)
           .query({ "$select": "id,name,file,folder,size,createdDateTime,lastModifiedDateTime,webUrl" })
           .get()
-      );
+      , "listFiles");
 
       const items = (response.value ?? []) as GraphItem[];
       return items
@@ -114,7 +116,7 @@ export class OneDriveProvider implements ProviderAdapter {
 
       const response = await this.withProviderRetry(() =>
         this.graphFetch(`/me/drive/items/${encodeURIComponent(fileId)}/content`)
-      );
+      , "getFileContent");
       return await response.text();
     } catch (error) {
       throw new ProviderError(`OneDrive getFileContent failed: ${safeErrorMessage(error, "Unexpected Microsoft Graph API error.")}`);
@@ -125,6 +127,9 @@ export class OneDriveProvider implements ProviderAdapter {
     try {
       const { directoryPath, fileName } = this.splitPath(name);
       const targetFolderId = await this.resolveDirectoryFolderId(folderId, directoryPath, true);
+      if (!targetFolderId) {
+        throw new ProviderError(`OneDrive upsertFile failed: could not resolve target folder for '${name}'.`);
+      }
 
       const response = await this.withProviderRetry(() =>
         this.graphFetch(
@@ -136,7 +141,8 @@ export class OneDriveProvider implements ProviderAdapter {
             },
             body: content,
           }
-        )
+        ),
+        "upsertFile"
       );
 
       const file = (await response.json()) as GraphItem;
@@ -146,11 +152,39 @@ export class OneDriveProvider implements ProviderAdapter {
     }
   }
 
+  async deleteFile(folderId: string, name: string): Promise<boolean> {
+    try {
+      const { directoryPath, fileName } = this.splitPath(name);
+      const targetFolderId = await this.resolveDirectoryFolderId(folderId, directoryPath, false);
+      if (!targetFolderId) {
+        return false;
+      }
+
+      const file = await this.findFileByName(targetFolderId, fileName);
+      if (!file?.id) {
+        return false;
+      }
+
+      const fileId = file.id;
+      await this.withProviderRetry(
+        () =>
+          this.graphFetch(`/me/drive/items/${encodeURIComponent(fileId)}`, {
+            method: "DELETE",
+          }),
+        "deleteFile"
+      );
+
+      return true;
+    } catch (error) {
+      throw new ProviderError(`OneDrive deleteFile failed: ${safeErrorMessage(error, "Unexpected Microsoft Graph API error.")}`);
+    }
+  }
+
   async getInitialSyncToken(folderId: string): Promise<string | undefined> {
     try {
       const delta = await this.withProviderRetry(() =>
         this.getAllDeltaPages(`/me/drive/items/${encodeURIComponent(folderId)}/delta`)
-      );
+      , "getInitialSyncToken");
       return delta.syncToken;
     } catch (error) {
       throw new ProviderError(`OneDrive getInitialSyncToken failed: ${safeErrorMessage(error, "Unexpected Microsoft Graph API error.")}`);
@@ -160,7 +194,7 @@ export class OneDriveProvider implements ProviderAdapter {
   async getIncrementalChanges(folderId: string, syncToken?: string): Promise<{ events: ChangeEvent[]; syncToken?: string }> {
     try {
       const start = syncToken ?? `/me/drive/items/${encodeURIComponent(folderId)}/delta`;
-      const delta = await this.withProviderRetry(() => this.getAllDeltaPages(start));
+      const delta = await this.withProviderRetry(() => this.getAllDeltaPages(start), "getIncrementalChanges");
 
       const events: ChangeEvent[] = [];
       for (const item of delta.items) {
@@ -212,7 +246,7 @@ export class OneDriveProvider implements ProviderAdapter {
         .api(`/me/drive/items/${encodeURIComponent(folderId)}/children`)
         .query({ "$select": "id,name,file,folder,size,createdDateTime,lastModifiedDateTime,webUrl,parentReference" })
         .get()
-    );
+    , "listFilesAndMetadata");
 
     return (response.value ?? []) as GraphItem[];
   }
@@ -282,7 +316,8 @@ export class OneDriveProvider implements ProviderAdapter {
           folder: {},
           "@microsoft.graph.conflictBehavior": "rename",
         }),
-      })
+      }),
+      "createFolder"
     );
 
     const item = (await response.json()) as GraphItem;
@@ -325,8 +360,13 @@ export class OneDriveProvider implements ProviderAdapter {
     return response;
   }
 
-  private async withProviderRetry<T>(task: () => Promise<T>): Promise<T> {
-    return runWithRetry(task, this.retryOptions, isTransientProviderError);
+  private async withProviderRetry<T>(task: () => Promise<T>, source: string): Promise<T> {
+    const context = {
+      source: `onedrive.${source}`,
+      provider: "onedrive" as const,
+      ...(this.telemetry ? { telemetry: this.telemetry } : {}),
+    };
+    return runWithRetry(task, this.retryOptions, isTransientProviderError, context);
   }
 
   private async getAllDeltaPages(startPathOrUrl: string): Promise<{ items: GraphItem[]; syncToken?: string }> {

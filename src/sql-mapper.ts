@@ -1,5 +1,6 @@
 import { FileBaseDB } from "./index";
 import { ConfigurationError, MetadataError, WriteConflictError } from "./errors";
+import { TableDBOptions, TelemetryHook } from "./types";
 
 export type ColumnType = "string" | "number" | "boolean" | "date";
 
@@ -46,8 +47,13 @@ const TABLE_INDEX_FILE = "_index.json";
 export class FileBasedTableDB {
   private schemas: Map<string, TableSchema> = new Map();
   private indexes: Map<string, TableIndex> = new Map();
+  private readonly namespace: string | undefined;
+  private readonly telemetry: TelemetryHook | undefined;
 
-  constructor(private db: FileBaseDB) {}
+  constructor(private db: FileBaseDB, options?: TableDBOptions) {
+    this.namespace = options?.namespace?.trim() ? sanitizePathSegment(options.namespace) : undefined;
+    this.telemetry = options?.telemetry;
+  }
 
   async createTable(schema: TableSchema): Promise<void> {
     this.validateSchema(schema);
@@ -128,6 +134,12 @@ export class FileBasedTableDB {
 
     const existing = await this.read(tableName, primaryKeyValue);
     if (existing && !this.isDeleted(existing)) {
+      this.telemetry?.onEvent?.({
+        type: "conflict",
+        source: "sql.insert",
+        message: `Duplicate primary key '${primaryKeyValue}' for table '${tableName}'.`,
+        timestamp: new Date().toISOString(),
+      });
       throw new WriteConflictError(
         `Record '${primaryKeyValue}' already exists in table '${tableName}'. Use update() or a new primary key.`
       );
@@ -279,6 +291,47 @@ export class FileBasedTableDB {
     return Object.keys(index.records).length;
   }
 
+  async listTableFiles(tableName: string): Promise<string[]> {
+    await this.getTableSchema(tableName);
+    const index = await this.loadIndex(tableName);
+
+    const files: string[] = [
+      this.schemaFileName(tableName),
+      this.indexFileName(tableName),
+    ];
+
+    for (const recordId of Object.keys(index.records)) {
+      files.push(this.recordFileName(tableName, recordId));
+    }
+
+    return files;
+  }
+
+  async migrateTableLayout(): Promise<{ migratedTables: string[] }> {
+    const rootFiles = await this.db.getFiles();
+    const discoveredTables = new Set<string>();
+
+    for (const file of rootFiles) {
+      if (file.name.endsWith(SCHEMA_SUFFIX)) {
+        discoveredTables.add(file.name.slice(0, -SCHEMA_SUFFIX.length));
+      }
+
+      if (file.name.endsWith(INDEX_SUFFIX)) {
+        discoveredTables.add(file.name.slice(0, -INDEX_SUFFIX.length));
+      }
+    }
+
+    const migratedTables: string[] = [];
+    for (const tableName of discoveredTables) {
+      const migrated = await this.migrateSingleTableLayout(tableName);
+      if (migrated) {
+        migratedTables.push(tableName);
+      }
+    }
+
+    return { migratedTables };
+  }
+
   async dropTable(tableName: string): Promise<void> {
     this.schemas.delete(tableName);
     this.indexes.delete(tableName);
@@ -380,6 +433,12 @@ export class FileBasedTableDB {
 
     const currentUpdatedAt = String(existing._updatedAt ?? "");
     if (currentUpdatedAt !== expectedUpdatedAt) {
+      this.telemetry?.onEvent?.({
+        type: "conflict",
+        source: "sql.optimisticCheck",
+        message: `Optimistic conflict for '${tableName}/${primaryKeyValue}'. expected ${expectedUpdatedAt}, got ${currentUpdatedAt}.`,
+        timestamp: new Date().toISOString(),
+      });
       throw new WriteConflictError(
         `Write conflict for '${tableName}/${primaryKeyValue}'. Expected _updatedAt '${expectedUpdatedAt}', current value is '${currentUpdatedAt}'.`
       );
@@ -574,23 +633,59 @@ export class FileBasedTableDB {
   }
 
   private schemaFileName(tableName: string): string {
-    return `${tableName}/${TABLE_SCHEMA_FILE}`;
+    return `${this.tableFolder(tableName)}/${TABLE_SCHEMA_FILE}`;
   }
 
   private indexFileName(tableName: string): string {
-    return `${tableName}/${TABLE_INDEX_FILE}`;
+    return `${this.tableFolder(tableName)}/${TABLE_INDEX_FILE}`;
   }
 
   private recordFileName(tableName: string, recordId: string): string {
-    return `${tableName}/${recordId}.json`;
+    return `${this.tableFolder(tableName)}/${recordId}.json`;
   }
 
   private legacySchemaFileName(tableName: string): string {
-    return `${tableName}${SCHEMA_SUFFIX}`;
+    return this.namespace
+      ? `${this.namespace}/${tableName}${SCHEMA_SUFFIX}`
+      : `${tableName}${SCHEMA_SUFFIX}`;
   }
 
   private legacyIndexFileName(tableName: string): string {
-    return `${tableName}${INDEX_SUFFIX}`;
+    return this.namespace
+      ? `${this.namespace}/${tableName}${INDEX_SUFFIX}`
+      : `${tableName}${INDEX_SUFFIX}`;
+  }
+
+  private tableFolder(tableName: string): string {
+    const normalized = sanitizePathSegment(tableName);
+    return this.namespace ? `${this.namespace}/${normalized}` : normalized;
+  }
+
+  private async migrateSingleTableLayout(tableName: string): Promise<boolean> {
+    const normalizedTableName = sanitizePathSegment(tableName);
+    const oldSchemaPath = this.legacySchemaFileName(normalizedTableName);
+    const oldIndexPath = this.legacyIndexFileName(normalizedTableName);
+    const newSchemaPath = this.schemaFileName(normalizedTableName);
+    const newIndexPath = this.indexFileName(normalizedTableName);
+
+    const oldSchema = await this.db.readFile(oldSchemaPath);
+    const oldIndex = await this.db.readFile(oldIndexPath);
+
+    if (!oldSchema && !oldIndex) {
+      return false;
+    }
+
+    if (oldSchema) {
+      await this.db.writeFile(newSchemaPath, oldSchema, "application/json");
+      await this.db.deleteFile(oldSchemaPath);
+    }
+
+    if (oldIndex) {
+      await this.db.writeFile(newIndexPath, oldIndex, "application/json");
+      await this.db.deleteFile(oldIndexPath);
+    }
+
+    return true;
   }
 
   private parseSqlSchema(sql: string): ParsedSqlTable[] {
@@ -727,8 +822,20 @@ export class FileBasedTableDB {
   }
 }
 
-export async function createTableDB(db: FileBaseDB): Promise<FileBasedTableDB> {
-  return new FileBasedTableDB(db);
+export async function createTableDB(db: FileBaseDB, options?: TableDBOptions): Promise<FileBasedTableDB> {
+  return new FileBasedTableDB(db, options);
+}
+
+export async function migrateTableLayout(
+  db: FileBaseDB,
+  options?: TableDBOptions
+): Promise<{ migratedTables: string[] }> {
+  const tables = new FileBasedTableDB(db, options);
+  return tables.migrateTableLayout();
+}
+
+function sanitizePathSegment(value: string): string {
+  return value.trim().replace(/\\/g, "_").replace(/\//g, "_");
 }
 
 export interface WriteConflictOptions {
