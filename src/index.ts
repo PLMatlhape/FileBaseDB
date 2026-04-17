@@ -3,6 +3,8 @@ import { ConfigurationError, FileBaseDBError } from "./errors";
 import { GoogleDriveProvider } from "./google";
 import { MetadataManager } from "./metadata";
 import { OneDriveProvider } from "./onedrive";
+import { withRetryDefaults } from "./retry";
+import { safeErrorMessage } from "./security";
 import {
   CacheStore,
   ChangeEvent,
@@ -27,17 +29,26 @@ export class FileBaseDB {
   private readonly cache: CacheStore;
   private readonly cacheTtlMs: number;
   private readonly pollingIntervalMs: number;
+  private readonly writeConflictPolicy: "retry-merge" | "fail-fast";
+  private readonly writeConflictMaxRetries: number;
+  private readonly writeConflictBackoffMs: number;
 
   private folderId?: string;
   private metadataManager?: MetadataManager;
   private syncToken?: string;
   private subscriptionTimers = new Set<NodeJS.Timeout>();
 
-  private constructor(providerName: ProviderName, provider: ProviderAdapter, options?: FileBaseDBOptions) {
+  /**
+   * Internal constructor. Use `connect()` for normal usage or `createFileBaseDB()` for testing/advanced scenarios.
+   */
+  constructor(providerName: ProviderName, provider: ProviderAdapter, options?: FileBaseDBOptions) {
     this.providerName = providerName;
     this.provider = provider;
     this.cacheTtlMs = options?.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
     this.pollingIntervalMs = options?.pollingIntervalMs ?? DEFAULT_POLLING_INTERVAL_MS;
+    this.writeConflictPolicy = options?.writeConflict?.policy ?? "retry-merge";
+    this.writeConflictMaxRetries = options?.writeConflict?.maxRetries ?? 3;
+    this.writeConflictBackoffMs = options?.writeConflict?.backoffMs ?? 120;
     this.cache = options?.useSQLiteCache ? new SQLiteCache(options?.sqliteDbPath) : new InMemoryCache();
   }
 
@@ -49,7 +60,7 @@ export class FileBaseDB {
     credentials: ProviderCredentials,
     options?: FileBaseDBOptions
   ): Promise<FileBaseDB> {
-    const provider = createProvider(providerName);
+    const provider = createProvider(providerName, options);
     await provider.initialize(credentials);
     return new FileBaseDB(providerName, provider, options);
   }
@@ -61,8 +72,21 @@ export class FileBaseDB {
     }
 
     this.folderId = resolvedFolderId;
-    this.metadataManager = new MetadataManager(this.provider, resolvedFolderId, this.cache, this.cacheTtlMs);
-    this.syncToken = await this.provider.getInitialSyncToken(resolvedFolderId);
+    this.metadataManager = new MetadataManager(
+      this.provider,
+      resolvedFolderId,
+      this.cache,
+      this.cacheTtlMs,
+      {
+        policy: this.writeConflictPolicy,
+        maxRetries: this.writeConflictMaxRetries,
+        backoffMs: this.writeConflictBackoffMs,
+      }
+    );
+    const initialSyncToken = await this.provider.getInitialSyncToken(resolvedFolderId);
+    if (initialSyncToken) {
+      this.syncToken = initialSyncToken;  // syncToken?: string is set only when defined
+    }
     return this;
   }
 
@@ -107,6 +131,22 @@ export class FileBaseDB {
     return removed;
   }
 
+  /**
+   * Write or overwrite a file in the folder
+   */
+  async writeFile(name: string, content: string | Buffer, mimeType = "text/plain"): Promise<FileRecord> {
+    const folderId = this.requireFolderId();
+    return this.provider.upsertFile(folderId, name, content, mimeType);
+  }
+
+  /**
+   * Read file content from the folder
+   */
+  async readFile(name: string): Promise<string | null> {
+    const folderId = this.requireFolderId();
+    return this.provider.getFileContent(folderId, name);
+  }
+
   subscribe(folderRef: string, callback: FolderChangeCallback): Unsubscribe {
     const targetFolderId = this.provider.resolveFolderId(folderRef);
     if (!targetFolderId) {
@@ -132,8 +172,9 @@ export class FileBaseDB {
           await callback(events);
         }
       } catch (error) {
+        const safeMessage = safeErrorMessage(error, "Subscription polling failed.");
         const wrapped = new FileBaseDBError(
-          `Subscription polling failed for ${this.providerName}/${targetFolderId}: ${(error as Error).message}`,
+          `Subscription polling failed for ${this.providerName}/${targetFolderId}: ${safeMessage}`,
           "SUBSCRIPTION_ERROR"
         );
         await callback([
@@ -159,6 +200,11 @@ export class FileBaseDB {
       clearInterval(timer);
     }
     this.subscriptionTimers.clear();
+    if (this.cache.dispose) {
+      this.cache.dispose();
+      return;
+    }
+
     this.cache.clear();
   }
 
@@ -199,13 +245,17 @@ export class FileBaseDB {
   }
 }
 
-function createProvider(provider: ProviderName): ProviderAdapter {
+function createProvider(
+  provider: ProviderName,
+  options?: FileBaseDBOptions
+): ProviderAdapter {
+  const retryOptions = withRetryDefaults(options?.retry);
   if (provider === "google") {
-    return new GoogleDriveProvider();
+    return new GoogleDriveProvider(retryOptions);
   }
 
   if (provider === "onedrive") {
-    return new OneDriveProvider();
+    return new OneDriveProvider(retryOptions);
   }
 
   throw new ConfigurationError(`Unsupported provider: ${provider}`);
@@ -219,5 +269,18 @@ export async function connect(
   return FileBaseDB.connect(provider, credentials, options);
 }
 
+/**
+ * Internal: Create a FileBaseDB instance directly with a provider.
+ * Used for testing and internal scenarios where credentials are pre-loaded.
+ */
+export function createFileBaseDB(
+  providerName: ProviderName,
+  provider: ProviderAdapter,
+  options?: FileBaseDBOptions
+): FileBaseDB {
+  return new FileBaseDB(providerName, provider, options);
+}
+
 export * from "./types";
 export * from "./errors";
+export * from "./sql-mapper";

@@ -3,6 +3,7 @@ import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
 import { connect } from "./index";
+import { safeErrorMessage } from "./security";
 import { FileFilters, ProviderCredentials, ProviderName } from "./types";
 
 type Args = {
@@ -52,10 +53,34 @@ function parseArgs(argv: string[]): Args {
   return args;
 }
 
-function readCredentials(credentialsPath: string): ProviderCredentials {
+function readCredentials(provider: ProviderName, credentialsPath: string): ProviderCredentials {
   const resolvedPath = path.resolve(process.cwd(), credentialsPath);
   const raw = fs.readFileSync(resolvedPath, "utf8");
-  return JSON.parse(raw) as ProviderCredentials;
+  const credentials = JSON.parse(raw) as ProviderCredentials;
+
+  if (typeof credentials !== "object" || credentials === null) {
+    throw new Error("Credentials file must contain a JSON object.");
+  }
+
+  if (provider === "onedrive") {
+    if (typeof (credentials as { accessToken?: unknown }).accessToken !== "string") {
+      throw new Error("OneDrive credentials must include an accessToken string.");
+    }
+  } else {
+    const googleCredentials = credentials as {
+      accessToken?: unknown;
+      refreshToken?: unknown;
+    };
+
+    const hasAccessToken = typeof googleCredentials.accessToken === "string";
+    const hasRefreshToken = typeof googleCredentials.refreshToken === "string";
+
+    if (!hasAccessToken && !hasRefreshToken) {
+      throw new Error("Google credentials must include an accessToken or refreshToken string.");
+    }
+  }
+
+  return credentials;
 }
 
 function printHelp(): void {
@@ -74,23 +99,25 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const credentials = readCredentials(args.credentialsPath);
+  const credentials = readCredentials(args.provider, args.credentialsPath);
   const db = await connect(args.provider, credentials);
-  await db.useFolder(args.folder);
+  try {
+    await db.useFolder(args.folder);
 
-  const filters: FileFilters = {};
-  if (args.tag) filters.tag = args.tag;
-  if (args.type) filters.type = args.type;
-  if (args.fromDate) filters.fromDate = args.fromDate;
-  if (args.toDate) filters.toDate = args.toDate;
+    const filters: FileFilters = {};
+    if (args.tag) filters.tag = args.tag;
+    if (args.type) filters.type = args.type;
+    if (args.fromDate) filters.fromDate = args.fromDate;
+    if (args.toDate) filters.toDate = args.toDate;
 
-  const files = await db.getFiles(filters);
-
-  console.log(JSON.stringify(files, null, 2));
-  db.disconnect();
+    const files = await db.getFiles(filters);
+    console.log(JSON.stringify(files, null, 2));
+  } finally {
+    db.disconnect();
+  }
 }
 
 void main().catch((error: Error) => {
-  console.error(`FileBaseDB CLI error: ${error.message}`);
+  console.error(`FileBaseDB CLI error: ${safeErrorMessage(error, "Unexpected CLI error.")}`);
   process.exit(1);
 });

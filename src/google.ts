@@ -1,5 +1,8 @@
 import { drive_v3, google } from "googleapis";
+import { Readable } from "node:stream";
 import { AuthenticationError, ProviderError } from "./errors";
+import { isTransientProviderError, RetryOptions, runWithRetry, withRetryDefaults } from "./retry";
+import { safeErrorMessage } from "./security";
 import { ChangeEvent, GoogleOAuthCredentials, ProviderAdapter, ProviderCredentials, FileRecord } from "./types";
 
 function toFileRecord(file: drive_v3.Schema$File, fallbackName = ""): FileRecord {
@@ -19,6 +22,11 @@ function toFileRecord(file: drive_v3.Schema$File, fallbackName = ""): FileRecord
 
 export class GoogleDriveProvider implements ProviderAdapter {
   private driveClient?: drive_v3.Drive;
+  private readonly retryOptions: RetryOptions;
+
+  constructor(retryOptions?: Partial<RetryOptions>) {
+    this.retryOptions = withRetryDefaults(retryOptions);
+  }
 
   async initialize(credentials: ProviderCredentials): Promise<void> {
     const googleCredentials = credentials as GoogleOAuthCredentials;
@@ -67,93 +75,112 @@ export class GoogleDriveProvider implements ProviderAdapter {
   async listFiles(folderId: string): Promise<FileRecord[]> {
     const client = this.getClient();
     try {
-      const response = await client.files.list({
-        q: `'${folderId}' in parents and trashed=false and name!='metadata.json'`,
-        fields: "files(id,name,mimeType,createdTime,modifiedTime,size,webViewLink)",
-        pageSize: 1000,
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-      });
+      const response = await this.withProviderRetry(() =>
+        client.files.list({
+          q: `'${folderId}' in parents and trashed=false and name!='metadata.json'`,
+          fields: "files(id,name,mimeType,createdTime,modifiedTime,size,webViewLink)",
+          pageSize: 1000,
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+        })
+      );
 
       return (response.data.files ?? []).map((file) => toFileRecord(file));
     } catch (error) {
-      throw new ProviderError(`Google listFiles failed: ${(error as Error).message}`);
+      throw new ProviderError(`Google listFiles failed: ${safeErrorMessage(error, "Unexpected Google Drive API error.")}`);
     }
   }
 
   async getFileContent(folderId: string, name: string): Promise<string | null> {
     const client = this.getClient();
+    const { directoryPath, fileName } = this.splitPath(name);
 
     try {
-      const metadataFileId = await this.findFileIdByName(folderId, name);
+      const targetFolderId = await this.resolveDirectoryFolderId(folderId, directoryPath, false);
+      if (!targetFolderId) {
+        return null;
+      }
+
+      const metadataFileId = await this.findFileIdByName(targetFolderId, fileName);
       if (!metadataFileId) {
         return null;
       }
 
-      const response = await client.files.get(
-        {
-          fileId: metadataFileId,
-          alt: "media",
-          supportsAllDrives: true,
-        },
-        {
-          responseType: "text",
-        }
+      const response = await this.withProviderRetry(() =>
+        client.files.get(
+          {
+            fileId: metadataFileId,
+            alt: "media",
+            supportsAllDrives: true,
+          },
+          {
+            responseType: "text",
+          }
+        )
       );
 
       return String(response.data ?? "");
     } catch (error) {
-      throw new ProviderError(`Google getFileContent failed: ${(error as Error).message}`);
+      throw new ProviderError(`Google getFileContent failed: ${safeErrorMessage(error, "Unexpected Google Drive API error.")}`);
     }
   }
 
-  async upsertFile(folderId: string, name: string, content: string, mimeType = "application/json"): Promise<FileRecord> {
+  async upsertFile(folderId: string, name: string, content: string | Buffer, mimeType = "application/json"): Promise<FileRecord> {
     const client = this.getClient();
+    const uploadBody = typeof content === "string" ? content : Readable.from([content]);
+    const { directoryPath, fileName } = this.splitPath(name);
 
     try {
-      const existingFileId = await this.findFileIdByName(folderId, name);
+      const targetFolderId = await this.resolveDirectoryFolderId(folderId, directoryPath, true);
+      const existingFileId = await this.findFileIdByName(targetFolderId, fileName);
       let response;
 
       if (existingFileId) {
-        response = await client.files.update({
-          fileId: existingFileId,
-          media: {
-            mimeType,
-            body: content,
-          },
-          fields: "id,name,mimeType,createdTime,modifiedTime,size,webViewLink",
-          supportsAllDrives: true,
-        });
+        response = await this.withProviderRetry(() =>
+          client.files.update({
+            fileId: existingFileId,
+            media: {
+              mimeType,
+              body: uploadBody,
+            },
+            fields: "id,name,mimeType,createdTime,modifiedTime,size,webViewLink",
+            supportsAllDrives: true,
+          })
+        );
       } else {
-        response = await client.files.create({
-          requestBody: {
-            name,
-            parents: [folderId],
-            mimeType,
-          },
-          media: {
-            mimeType,
-            body: content,
-          },
-          fields: "id,name,mimeType,createdTime,modifiedTime,size,webViewLink",
-          supportsAllDrives: true,
-        });
+        response = await this.withProviderRetry(() =>
+          client.files.create({
+            requestBody: {
+              name: fileName,
+              parents: [targetFolderId],
+              mimeType,
+            },
+            media: {
+              mimeType,
+              body: uploadBody,
+            },
+            fields: "id,name,mimeType,createdTime,modifiedTime,size,webViewLink",
+            supportsAllDrives: true,
+          })
+        );
       }
 
       const file = response.data;
-      return toFileRecord(file, name);
+      return toFileRecord(file, fileName);
     } catch (error) {
-      throw new ProviderError(`Google upsertFile failed: ${(error as Error).message}`);
+      throw new ProviderError(`Google upsertFile failed: ${safeErrorMessage(error, "Unexpected Google Drive API error.")}`);
     }
   }
 
   async getInitialSyncToken(_folderId: string): Promise<string | undefined> {
     const client = this.getClient();
     try {
-      const response = await client.changes.getStartPageToken({ supportsAllDrives: true });
+      const response = await this.withProviderRetry(() =>
+        client.changes.getStartPageToken({ supportsAllDrives: true })
+      );
       return response.data.startPageToken ?? undefined;
     } catch (error) {
-      throw new ProviderError(`Google getInitialSyncToken failed: ${(error as Error).message}`);
+      throw new ProviderError(`Google getInitialSyncToken failed: ${safeErrorMessage(error, "Unexpected Google Drive API error.")}`);
     }
   }
 
@@ -170,13 +197,16 @@ export class GoogleDriveProvider implements ProviderAdapter {
       let newSyncToken: string | undefined;
 
       while (pageToken) {
-        const listResult = await client.changes.list({
-          pageToken,
-          spaces: "drive",
-          includeItemsFromAllDrives: true,
-          supportsAllDrives: true,
-          fields: "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,createdTime,modifiedTime,size,webViewLink,parents))",
-        });
+        const currentPageToken = pageToken;
+        const listResult = await this.withProviderRetry(() =>
+          client.changes.list({
+            pageToken: currentPageToken,
+            spaces: "drive",
+            includeItemsFromAllDrives: true,
+            supportsAllDrives: true,
+            fields: "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,createdTime,modifiedTime,size,webViewLink,parents))",
+          })
+        );
         const changeList: drive_v3.Schema$ChangeList = listResult.data;
 
         const changes = changeList.changes ?? [];
@@ -221,7 +251,7 @@ export class GoogleDriveProvider implements ProviderAdapter {
 
       return { events };
     } catch (error) {
-      throw new ProviderError(`Google getIncrementalChanges failed: ${(error as Error).message}`);
+      throw new ProviderError(`Google getIncrementalChanges failed: ${safeErrorMessage(error, "Unexpected Google Drive API error.")}`);
     }
   }
 
@@ -234,14 +264,106 @@ export class GoogleDriveProvider implements ProviderAdapter {
 
   private async findFileIdByName(folderId: string, fileName: string): Promise<string | undefined> {
     const client = this.getClient();
-    const response = await client.files.list({
-      q: `'${folderId}' in parents and trashed=false and name='${fileName.replace(/'/g, "\\'")}'`,
-      fields: "files(id,name)",
-      pageSize: 1,
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true,
-    });
+    const response = await this.withProviderRetry(() =>
+      client.files.list({
+        q: `'${folderId}' in parents and trashed=false and name='${fileName.replace(/'/g, "\\'")}'`,
+        fields: "files(id,name)",
+        pageSize: 1,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+      })
+    );
 
     return response.data.files?.[0]?.id ?? undefined;
+  }
+
+  private splitPath(pathOrName: string): { directoryPath: string; fileName: string } {
+    const normalized = pathOrName.replace(/\\/g, "/").trim();
+    const cleaned = normalized.replace(/^\/+|\/+$/g, "");
+    if (!cleaned) {
+      throw new ProviderError("File path is empty.");
+    }
+
+    const parts = cleaned.split("/").filter(Boolean);
+    const fileName = parts.pop();
+    if (!fileName) {
+      throw new ProviderError("File path must include a file name.");
+    }
+
+    return {
+      directoryPath: parts.join("/"),
+      fileName,
+    };
+  }
+
+  private async resolveDirectoryFolderId(
+    rootFolderId: string,
+    directoryPath: string,
+    createIfMissing: boolean
+  ): Promise<string | undefined> {
+    if (!directoryPath) {
+      return rootFolderId;
+    }
+
+    const segments = directoryPath.split("/").filter(Boolean);
+    let currentFolderId = rootFolderId;
+
+    for (const segment of segments) {
+      const existing = await this.findChildFolderIdByName(currentFolderId, segment);
+      if (existing) {
+        currentFolderId = existing;
+        continue;
+      }
+
+      if (!createIfMissing) {
+        return undefined;
+      }
+
+      currentFolderId = await this.createFolder(currentFolderId, segment);
+    }
+
+    return currentFolderId;
+  }
+
+  private async findChildFolderIdByName(parentFolderId: string, folderName: string): Promise<string | undefined> {
+    const client = this.getClient();
+    const escapedName = folderName.replace(/'/g, "\\'");
+    const response = await this.withProviderRetry(() =>
+      client.files.list({
+        q: `'${parentFolderId}' in parents and trashed=false and name='${escapedName}' and mimeType='application/vnd.google-apps.folder'`,
+        fields: "files(id,name)",
+        pageSize: 1,
+        supportsAllDrives: true,
+        includeItemsFromAllDrives: true,
+      })
+    );
+
+    return response.data.files?.[0]?.id ?? undefined;
+  }
+
+  private async createFolder(parentFolderId: string, folderName: string): Promise<string> {
+    const client = this.getClient();
+    const created = await this.withProviderRetry(() =>
+      client.files.create({
+        requestBody: {
+          name: folderName,
+          mimeType: "application/vnd.google-apps.folder",
+          parents: [parentFolderId],
+        },
+        fields: "id",
+        supportsAllDrives: true,
+      })
+    );
+
+    const id = created.data.id;
+    if (!id) {
+      throw new ProviderError(`Google create folder failed for '${folderName}'.`);
+    }
+
+    return id;
+  }
+
+  private async withProviderRetry<T>(task: () => Promise<T>): Promise<T> {
+    return runWithRetry(task, this.retryOptions, isTransientProviderError);
   }
 }
