@@ -35,6 +35,10 @@ export class InMemoryCache implements CacheStore {
   clear(): void {
     this.store.clear();
   }
+
+  dispose(): void {
+    this.clear();
+  }
 }
 
 export class SQLiteCache implements CacheStore {
@@ -100,5 +104,14 @@ export class SQLiteCache implements CacheStore {
   clear(): void {
     this.memory.clear();
     this.db.run("DELETE FROM cache");
+  }
+
+  dispose(): void {
+    this.memory.clear();
+    this.db.close((error) => {
+      if (error) {
+        // Best-effort cleanup; consumers already disconnected.
+      }
+    });
   }
 }
