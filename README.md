@@ -1,219 +1,290 @@
 # FileBaseDB
 
-FileBaseDB is a TypeScript/Node.js developer library that treats cloud folders as lightweight databases.
+FileBaseDB is a TypeScript/Node.js library that turns Google Drive or OneDrive folders into lightweight, metadata-aware datasets.
 
-- **Dataset** = a Google Drive or OneDrive folder
-- **Record** = a file in that folder
-- **Schema/metadata** = `metadata.json` stored in the folder
+- Dataset: one cloud folder
+- Record: one file in that folder
+- Metadata store: metadata.json in the same folder
+- Optional SQL mapper: table-like schemas and CRUD over JSON record files
 
-It is designed for simple, low-friction file-based applications where you need queryable metadata without operating a traditional DB server.
+Supported runtime: Node.js 20+
 
-## Features
+## Production readiness status
 
-- OAuth 2.0 token-based authentication for Google Drive and Microsoft Graph (OneDrive)
-- Folder ID/link mapping to a dataset context
-- Query files with filters (`tag`, `type`, date range, metadata fields)
-- Add/update/remove metadata in `metadata.json`
-- Incremental sync with provider change APIs:
-	- Google Drive `changes` API + page tokens
-	- OneDrive `delta` API + delta links
-- Local caching and precomputed metadata indexes (tags + categories)
-- Optional CLI for local query testing
+Current status: production-capable for file-centric workloads with documented limits.
 
-## Installation
+Ready now:
+
+- OAuth-based provider connectivity (Google Drive, OneDrive)
+- Metadata indexing and filtering
+- Incremental sync subscriptions
+- Local caching (memory and SQLite option)
+- Built-in retry/backoff for transient provider failures
+- Conflict-aware metadata and table operations
+- Telemetry hooks for retry/throttle/conflict events
+- Typed error model
+- Secret redaction in key error paths
+- CI build/test/security workflow support
+
+Still recommended before high-scale or mission-critical use:
+
+- Integration tests in your own environment and quotas
+- Concurrency strategy for competing writes
+- Operational monitoring around provider/API failures
+
+## Install
 
 ```bash
 npm install filebasedb
 ```
 
-For local development:
-
-```bash
-npm install
-npm run build
-```
-
-## Required Scopes
-
-- **Google Drive**: `https://www.googleapis.com/auth/drive`
-- **OneDrive (Graph)**: `Files.ReadWrite.All`
-
-## Quick Start
+## Quick start
 
 ```ts
 import { connect } from "filebasedb";
 
-async function main() {
-	const db = await connect("google", {
-		accessToken: process.env.GOOGLE_ACCESS_TOKEN,
-		refreshToken: process.env.GOOGLE_REFRESH_TOKEN,
-		clientId: process.env.GOOGLE_CLIENT_ID,
-		clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-		redirectUri: process.env.GOOGLE_REDIRECT_URI,
-	});
+const db = await connect("google", {
+  accessToken: process.env.GOOGLE_ACCESS_TOKEN,
+  refreshToken: process.env.GOOGLE_REFRESH_TOKEN,
+  clientId: process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  redirectUri: process.env.GOOGLE_REDIRECT_URI,
+});
 
-	await db.useFolder("1A2B3C-your-folder-id");
+await db.useFolder("<folder-id-or-link>");
 
-	const files = await db.getFiles({ tag: "invoice", type: "pdf" });
-	console.log(files);
+const files = await db.getFiles({ tag: "invoice", type: "pdf" });
+console.log(files);
 
-	await db.addMetadata("file-id-123", {
-		tags: ["invoice", "approved"],
-		category: "finance",
-		reviewer: "team-a",
-	});
-
-	const unsubscribe = db.subscribe("1A2B3C-your-folder-id", (events) => {
-		console.log("changes", events);
-	});
-
-	setTimeout(() => {
-		unsubscribe();
-		db.disconnect();
-	}, 30000);
-}
-
-void main();
+db.disconnect();
 ```
 
-## Public API
+## Core capabilities
 
-### `connect(provider, credentials, options?)`
+- Connect to Google Drive or OneDrive using OAuth credentials
+- Resolve and bind a folder as an active dataset
+- Read file records with metadata filters
+- Add/update/remove metadata entries
+- Subscribe to incremental folder changes
+- Read/write content files directly using SDK methods
 
-Creates a provider session.
+## SQL mapper capabilities
 
-- `provider`: `"google" | "onedrive"`
-- `credentials`:
-	- Google: `{ accessToken?, refreshToken?, clientId?, clientSecret?, redirectUri? }`
-	- OneDrive: `{ accessToken }`
-- `options`:
-	- `cacheTtlMs?: number`
-	- `pollingIntervalMs?: number`
-	- `useSQLiteCache?: boolean`
-	- `sqliteDbPath?: string`
+The SQL mapper offers table-like behavior on top of folder storage:
 
-### `useFolder(folderIdOrLink)`
+- createTable(schema)
+- insert/read/update/delete
+- query(filter)
+- count
+- import SQL CREATE TABLE schema text or files
 
-Resolves and stores the active dataset folder.
+Storage layout per table:
 
-### `getFiles(filters?)`
+- each table is created as a subfolder under the linked main folder
+- schema and index are stored inside that subfolder
+- all records for that table are stored inside the same subfolder
 
-Returns files merged with metadata entries.
+Write-conflict behavior:
 
-Supported filters:
+- insert throws conflict when primary key already exists
+- update/delete can use optimistic checks via expectedUpdatedAt
 
-- `tag`
-- `category`
-- `type` (matches MIME type)
-- `fromDate` / `toDate` (ISO date)
-- `metadata` (exact key/value matching)
+Example:
 
-### `addMetadata(fileId, metadataObject)`
+```ts
+import { connect, createTableDB } from "filebasedb";
 
-Adds or updates metadata entry for a file and rewrites `metadata.json`.
+const db = await connect("google", credentials);
+await db.useFolder(folderId);
 
-### `updateMetadata(fileId, metadataObject)`
+const tables = await createTableDB(db);
 
-Explicit alias of `addMetadata`.
+await tables.createTable({
+  tableName: "products",
+  columns: {
+    id: { type: "string" },
+    name: { type: "string" },
+    price: { type: "number" },
+    active: { type: "boolean" },
+  },
+  primaryKey: "id",
+});
 
-### `removeMetadata(fileId)`
-
-Removes a metadata entry.
-
-### `subscribe(folderId, callback)`
-
-Starts incremental polling and emits file change events.
-
-Returns an `unsubscribe()` function.
-
-## Workflow Mapping
-
-1. **Setup**: install package, configure OAuth credentials and folder ID.
-2. **Folder Mapping**: call `useFolder` to bind dataset context.
-3. **Query Layer**: call `getFiles` with optional filters.
-4. **Metadata Management**: call `addMetadata`/`removeMetadata`, persisted in `metadata.json`.
-5. **Performance Optimizations**:
-	 - local cache for file and metadata data
-	 - incremental sync tokens for provider changes
-	 - precomputed metadata indexes for tags/categories
-
-## Project Structure
-
-```text
-src/
-	index.ts        # main SDK entry
-	google.ts       # Google Drive provider
-	onedrive.ts     # OneDrive provider
-	metadata.ts     # metadata.json management + indexes
-	cache.ts        # local cache implementations
-	cli.ts          # optional CLI
-	types.ts        # public type contracts
-	errors.ts       # custom typed errors
-examples/
-	demo.ts
+await tables.insert("products", {
+  id: "p-001",
+  name: "Margherita Pizza",
+  price: 9.99,
+  active: true,
+});
 ```
 
-## CLI (Optional)
+Advanced SQL mapper example (namespace + telemetry + table file listing + layout migration):
 
-Build first:
+```ts
+import { connect, createTableDB, migrateTableLayout } from "filebasedb";
+
+const db = await connect("onedrive", credentials, {
+  telemetry: {
+    onEvent: (event) => {
+      console.log("[filebasedb]", event.type, event.source, event.message);
+    },
+  },
+});
+
+await db.useFolder(folderId);
+
+const tenantTables = await createTableDB(db, {
+  namespace: "tenant-a",
+  telemetry: {
+    onEvent: (event) => {
+      if (event.type === "conflict") {
+        console.warn("Conflict event", event);
+      }
+    },
+  },
+});
+
+await tenantTables.createTable({
+  tableName: "orders",
+  columns: {
+    id: { type: "string" },
+    total: { type: "number" },
+  },
+  primaryKey: "id",
+});
+
+const files = await tenantTables.listTableFiles("orders");
+await migrateTableLayout(db, { namespace: "tenant-a" });
+```
+
+## Image storage and rendering
+
+FileBaseDB can store binary files (including images) in provider folders and return metadata that apps can render.
+
+- Upload image with writeFile(path, buffer, mimeType)
+- Persist returned drive/graph file id and web URL in metadata or SQL mapper table
+- Render in frontend with URL or backend-proxied fetch
+
+Important: FileBaseDB does not render images itself.
+
+## API summary
+
+- connect(provider, credentials, options?)
+- useFolder(folderIdOrLink)
+- getFiles(filters?)
+- addMetadata(fileId, metadata)
+- updateMetadata(fileId, metadata)
+- removeMetadata(fileId)
+- writeFile(name, content, mimeType?)
+- readFile(name)
+- deleteFile(name)
+- subscribe(folderId, callback)
+- disconnect()
+- createTableDB(db, options?)
+- migrateTableLayout(db, options?)
+
+## Required scopes
+
+Google Drive:
+
+- https://www.googleapis.com/auth/drive
+
+OneDrive (Microsoft Graph):
+
+- Files.ReadWrite.All
+
+## Configuration options
+
+connect options:
+
+- cacheTtlMs
+- pollingIntervalMs
+- useSQLiteCache
+- sqliteDbPath
+- retry.maxAttempts/baseDelayMs/maxDelayMs/jitterRatio
+- writeConflict.policy/maxRetries/backoffMs
+- telemetry.onEvent(event)
+
+SQL mapper options:
+
+- namespace
+- telemetry.onEvent(event)
+
+## Limitations
+
+- Not a full SQL engine
+- No multi-record ACID transactions
+- Query performance depends on provider API and folder size
+- No built-in RBAC beyond provider permissions
+- High-concurrency write coordination is app responsibility
+
+## When to use vs when not to use
+
+| Scenario | Fit |
+| --- | --- |
+| Data already lives in Drive/OneDrive folders | Strong |
+| File-centric apps with metadata filtering | Strong |
+| Internal tools and moderate traffic workloads | Strong |
+| Complex relational joins/analytics workloads | Weak |
+| Strict multi-record transactions (ACID) required | Weak |
+| Very high write concurrency across many workers | Weak |
+
+## Production readiness guidance
+
+Practical readiness: **8/10** for lightweight-to-moderate production workloads.
+
+Ready now:
+
+- Retry with backoff/jitter for transient provider failures
+- Conflict-aware metadata and table updates
+- Telemetry hooks for retry/throttle/conflict events
+- Incremental sync subscriptions and metadata indexing
+- Namespaced SQL mapper layout and table layout migration helper
+
+Recommended before high-scale, mission-critical workloads:
+
+- Define SLOs, alerts, and dashboards around provider/API failure rates
+- Run smoke tests in target tenant with real quotas and auth flow
+- Add app-level strategy for hot-row contention and idempotency
+- Validate backup/restore process for target provider folders
+
+## Testing and release checks
+
+Run locally:
 
 ```bash
 npm run build
+npm test
 ```
 
-Run via source:
+Run environment-specific integration smoke test (real OAuth app + quota):
 
 ```bash
-npm run cli -- --provider google --folder <folderId> --credentials ./credentials.json --tag invoice
+# set FILEBASEDB_SMOKE_TEST=1, FILEBASEDB_PROVIDER, FILEBASEDB_FOLDER_ID,
+# and provider credentials in env first
+npm run test:smoke
 ```
 
-Installed binary:
+Release checklist:
 
-```bash
-filebasedb --provider onedrive --folder <folderId> --credentials ./credentials.json --type image
-```
+- PUBLISHING_CHECKLIST.md
 
-`credentials.json` examples:
+Security policy:
 
-Google:
+- SECURITY.md
 
-```json
-{
-	"accessToken": "...",
-	"refreshToken": "...",
-	"clientId": "...",
-	"clientSecret": "...",
-	"redirectUri": "http://localhost"
-}
-```
+## Developer documentation
 
-OneDrive:
+- DEVELOPER_MANUAL.md
+- FILEBASEDB_OVERVIEW.md
+- CONTRIBUTING.md
 
-```json
-{
-	"accessToken": "..."
-}
-```
+## Repository layout
 
-## Extensibility
-
-To add another provider (for example Firebase or Azure Blob):
-
-1. Implement `ProviderAdapter` methods.
-2. Register provider in `createProvider(...)` in `src/index.ts`.
-3. Reuse `MetadataManager` and cache logic unchanged.
-
-## Error Handling
-
-The SDK provides typed errors:
-
-- `AuthenticationError`
-- `ConfigurationError`
-- `ProviderError`
-- `MetadataError`
-
-These include descriptive messages to simplify troubleshooting in API integrations.
+- src/: library source
+- tests/: unit tests
+- examples/: usage samples
 
 ## License
 
-Apache 2.0. See [LICENSE](./LICENSE).
+Apache 2.0. See LICENSE.

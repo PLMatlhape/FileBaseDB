@@ -43,6 +43,7 @@ export interface FileMetadataEntry {
 
 export interface MetadataDocument {
   version: number;
+  revision?: number;
   updatedAt: string;
   entries: Record<string, FileMetadataEntry>;
   indexes: {
@@ -53,6 +54,21 @@ export interface MetadataDocument {
 
 export interface FileWithMetadata extends FileRecord {
   metadata?: FileMetadataEntry;
+}
+
+export type TelemetryEventType = "retry" | "conflict" | "throttle";
+
+export interface TelemetryEvent {
+  type: TelemetryEventType;
+  source: string;
+  provider?: ProviderName;
+  attempt?: number;
+  message?: string;
+  timestamp: string;
+}
+
+export interface TelemetryHook {
+  onEvent?: (event: TelemetryEvent) => void;
 }
 
 export type ChangeType = "added" | "updated" | "removed";
@@ -72,9 +88,15 @@ export interface ProviderAdapter {
   resolveFolderId(folderRef: string): string;
   listFiles(folderId: string): Promise<FileRecord[]>;
   getFileContent(folderId: string, name: string): Promise<string | null>;
-  upsertFile(folderId: string, name: string, content: string, mimeType?: string): Promise<FileRecord>;
+  upsertFile(folderId: string, name: string, content: string | Buffer, mimeType?: string): Promise<FileRecord>;
+  deleteFile(folderId: string, name: string): Promise<boolean>;
   getInitialSyncToken(folderId: string): Promise<string | undefined>;
   getIncrementalChanges(folderId: string, syncToken?: string): Promise<{ events: ChangeEvent[]; syncToken?: string }>;
+}
+
+export interface TableDBOptions {
+  namespace?: string;
+  telemetry?: TelemetryHook;
 }
 
 export interface CacheStore {
@@ -82,6 +104,7 @@ export interface CacheStore {
   set<T>(key: string, value: T, ttlMs?: number): void;
   delete(key: string): void;
   clear(): void;
+  dispose?(): void;
 }
 
 export interface FileBaseDBOptions {
@@ -89,4 +112,16 @@ export interface FileBaseDBOptions {
   pollingIntervalMs?: number;
   useSQLiteCache?: boolean;
   sqliteDbPath?: string;
+  retry?: {
+    maxAttempts?: number;
+    baseDelayMs?: number;
+    maxDelayMs?: number;
+    jitterRatio?: number;
+  };
+  writeConflict?: {
+    policy?: "retry-merge" | "fail-fast";
+    maxRetries?: number;
+    backoffMs?: number;
+  };
+  telemetry?: TelemetryHook;
 }

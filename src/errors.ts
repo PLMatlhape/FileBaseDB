@@ -35,3 +35,10 @@ export class MetadataError extends FileBaseDBError {
     this.name = "MetadataError";
   }
 }
+
+export class WriteConflictError extends FileBaseDBError {
+  constructor(message: string) {
+    super(message, "WRITE_CONFLICT_ERROR");
+    this.name = "WriteConflictError";
+  }
+}

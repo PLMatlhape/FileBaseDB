@@ -2,16 +2,31 @@
   "name": "filebasedb",
   "version": "0.1.0",
   "description": "Treat Google Drive or OneDrive folders as lightweight, metadata-driven databases.",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "DEVELOPER_MANUAL.md",
+    "FILEBASEDB_OVERVIEW.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "PUBLISHING_CHECKLIST.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "node -e \"const fs=require('node:fs');if(fs.existsSync('dist'))fs.rmSync('dist',{recursive:true,force:true});\"",
+    "test": "npm run clean && npm run build && node --test dist/tests/*.test.js",
+    "test:smoke": "npm run clean && npm run build && node --test dist/tests/integration.smoke.test.js",
     "dev": "ts-node examples/demo.ts",
     "cli": "ts-node src/cli.ts",
     "prepare": "npm run build"
@@ -30,6 +45,12 @@
   "author": "",
   "license": "Apache-2.0",
   "type": "commonjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "bugs": {
     "url": "https://github.com/PLMatlhape/FileBaseDB/issues"
   },
@@ -48,6 +69,6 @@
     "sqlite3": "^6.0.1"
   },
   "bin": {
-    "filebasedb": "dist/cli.js"
+    "filebasedb": "dist/src/cli.js"
   }
 }
