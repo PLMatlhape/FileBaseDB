@@ -3,7 +3,7 @@ import { Readable } from "node:stream";
 import { AuthenticationError, ProviderError } from "./errors";
 import { isTransientProviderError, RetryOptions, runWithRetry, withRetryDefaults } from "./retry";
 import { safeErrorMessage } from "./security";
-import { ChangeEvent, GoogleOAuthCredentials, ProviderAdapter, ProviderCredentials, FileRecord } from "./types";
+import { ChangeEvent, GoogleOAuthCredentials, ProviderAdapter, ProviderCredentials, FileRecord, TelemetryHook } from "./types";
 
 function toFileRecord(file: drive_v3.Schema$File, fallbackName = ""): FileRecord {
   const record: FileRecord = {
@@ -23,9 +23,11 @@ function toFileRecord(file: drive_v3.Schema$File, fallbackName = ""): FileRecord
 export class GoogleDriveProvider implements ProviderAdapter {
   private driveClient?: drive_v3.Drive;
   private readonly retryOptions: RetryOptions;
+  private readonly telemetry: TelemetryHook | undefined;
 
-  constructor(retryOptions?: Partial<RetryOptions>) {
+  constructor(retryOptions?: Partial<RetryOptions>, telemetry?: TelemetryHook) {
     this.retryOptions = withRetryDefaults(retryOptions);
+    this.telemetry = telemetry;
   }
 
   async initialize(credentials: ProviderCredentials): Promise<void> {
@@ -82,7 +84,8 @@ export class GoogleDriveProvider implements ProviderAdapter {
           pageSize: 1000,
           supportsAllDrives: true,
           includeItemsFromAllDrives: true,
-        })
+        }),
+        "listFiles"
       );
 
       return (response.data.files ?? []).map((file) => toFileRecord(file));
@@ -116,7 +119,8 @@ export class GoogleDriveProvider implements ProviderAdapter {
           {
             responseType: "text",
           }
-        )
+        ),
+        "getFileContent"
       );
 
       return String(response.data ?? "");
@@ -132,6 +136,9 @@ export class GoogleDriveProvider implements ProviderAdapter {
 
     try {
       const targetFolderId = await this.resolveDirectoryFolderId(folderId, directoryPath, true);
+      if (!targetFolderId) {
+        throw new ProviderError(`Google upsertFile failed: could not resolve target folder for '${name}'.`);
+      }
       const existingFileId = await this.findFileIdByName(targetFolderId, fileName);
       let response;
 
@@ -145,7 +152,8 @@ export class GoogleDriveProvider implements ProviderAdapter {
             },
             fields: "id,name,mimeType,createdTime,modifiedTime,size,webViewLink",
             supportsAllDrives: true,
-          })
+          }),
+          "upsertFile:update"
         );
       } else {
         response = await this.withProviderRetry(() =>
@@ -161,7 +169,8 @@ export class GoogleDriveProvider implements ProviderAdapter {
             },
             fields: "id,name,mimeType,createdTime,modifiedTime,size,webViewLink",
             supportsAllDrives: true,
-          })
+          }),
+          "upsertFile:create"
         );
       }
 
@@ -172,12 +181,42 @@ export class GoogleDriveProvider implements ProviderAdapter {
     }
   }
 
+  async deleteFile(folderId: string, name: string): Promise<boolean> {
+    const client = this.getClient();
+    const { directoryPath, fileName } = this.splitPath(name);
+
+    try {
+      const targetFolderId = await this.resolveDirectoryFolderId(folderId, directoryPath, false);
+      if (!targetFolderId) {
+        return false;
+      }
+
+      const fileId = await this.findFileIdByName(targetFolderId, fileName);
+      if (!fileId) {
+        return false;
+      }
+
+      await this.withProviderRetry(
+        () =>
+          client.files.delete({
+            fileId,
+            supportsAllDrives: true,
+          }),
+        "deleteFile"
+      );
+
+      return true;
+    } catch (error) {
+      throw new ProviderError(`Google deleteFile failed: ${safeErrorMessage(error, "Unexpected Google Drive API error.")}`);
+    }
+  }
+
   async getInitialSyncToken(_folderId: string): Promise<string | undefined> {
     const client = this.getClient();
     try {
       const response = await this.withProviderRetry(() =>
         client.changes.getStartPageToken({ supportsAllDrives: true })
-      );
+      , "getInitialSyncToken");
       return response.data.startPageToken ?? undefined;
     } catch (error) {
       throw new ProviderError(`Google getInitialSyncToken failed: ${safeErrorMessage(error, "Unexpected Google Drive API error.")}`);
@@ -205,7 +244,8 @@ export class GoogleDriveProvider implements ProviderAdapter {
             includeItemsFromAllDrives: true,
             supportsAllDrives: true,
             fields: "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,createdTime,modifiedTime,size,webViewLink,parents))",
-          })
+          }),
+          "getIncrementalChanges"
         );
         const changeList: drive_v3.Schema$ChangeList = listResult.data;
 
@@ -271,7 +311,8 @@ export class GoogleDriveProvider implements ProviderAdapter {
         pageSize: 1,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
-      })
+      }),
+      "findFileIdByName"
     );
 
     return response.data.files?.[0]?.id ?? undefined;
@@ -335,7 +376,8 @@ export class GoogleDriveProvider implements ProviderAdapter {
         pageSize: 1,
         supportsAllDrives: true,
         includeItemsFromAllDrives: true,
-      })
+      }),
+      "findChildFolderIdByName"
     );
 
     return response.data.files?.[0]?.id ?? undefined;
@@ -352,7 +394,8 @@ export class GoogleDriveProvider implements ProviderAdapter {
         },
         fields: "id",
         supportsAllDrives: true,
-      })
+      }),
+      "createFolder"
     );
 
     const id = created.data.id;
@@ -363,7 +406,12 @@ export class GoogleDriveProvider implements ProviderAdapter {
     return id;
   }
 
-  private async withProviderRetry<T>(task: () => Promise<T>): Promise<T> {
-    return runWithRetry(task, this.retryOptions, isTransientProviderError);
+  private async withProviderRetry<T>(task: () => Promise<T>, source: string): Promise<T> {
+    const context = {
+      source: `google.${source}`,
+      provider: "google" as const,
+      ...(this.telemetry ? { telemetry: this.telemetry } : {}),
+    };
+    return runWithRetry(task, this.retryOptions, isTransientProviderError, context);
   }
 }

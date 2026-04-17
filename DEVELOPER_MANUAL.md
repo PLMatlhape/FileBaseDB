@@ -76,6 +76,11 @@ const db = await connect("google", credentials, {
     maxRetries: 3,
     backoffMs: 120,
   },
+  telemetry: {
+    onEvent: (event) => {
+      console.log(event.type, event.source, event.message);
+    },
+  },
 });
 
 await db.useFolder(folderIdOrLink);
@@ -146,12 +151,14 @@ Table organization:
 - table records are saved in that same table subfolder
 
 ```ts
-import { connect, createTableDB } from "filebasedb";
+import { connect, createTableDB, migrateTableLayout } from "filebasedb";
 
 const db = await connect("google", credentials);
 await db.useFolder(folderId);
 
-const tables = await createTableDB(db);
+const tables = await createTableDB(db, {
+  namespace: "tenant-a",
+});
 
 await tables.createTable({
   tableName: "products",
@@ -178,6 +185,11 @@ await tables.update(
   { price: 13.49 },
   { expectedUpdatedAt: product?._updatedAt }
 );
+
+const files = await tables.listTableFiles("products");
+console.log(files);
+
+await migrateTableLayout(db, { namespace: "tenant-a" });
 ```
 
 ### SQL schema import
@@ -215,7 +227,7 @@ Important:
 - Store OAuth credentials in secure secret management
 - Use least-privilege scopes
 - Do not log raw tokens or secrets
-- Use retry/backoff in your app layer for provider transient errors
+- Configure built-in retry/backoff and monitor telemetry events
 - Use dedicated folders per environment (dev/stage/prod)
 - Use db.disconnect() on shutdown
 - Run npm test in CI for every change

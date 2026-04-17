@@ -2,12 +2,12 @@
   "name": "filebasedb",
   "version": "0.1.0",
   "description": "Treat Google Drive or OneDrive folders as lightweight, metadata-driven databases.",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
     },
     "./package.json": "./package.json"
   },
@@ -69,6 +69,6 @@
     "sqlite3": "^6.0.1"
   },
   "bin": {
-    "filebasedb": "dist/cli.js"
+    "filebasedb": "dist/src/cli.js"
   }
 }
