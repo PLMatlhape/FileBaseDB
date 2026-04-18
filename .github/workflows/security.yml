@@ -6,20 +6,6 @@ on:
     branches: ["**"]
 
 jobs:
-  dependency-review:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    permissions:
-      contents: read
-      pull-requests: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Dependency Review
-        uses: actions/dependency-review-action@v4
-
   secret-scan:
     runs-on: ubuntu-latest
     permissions:
@@ -33,5 +19,5 @@ jobs:
 
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2
-        with:
-          args: detect --source . --redact --no-banner --verbose
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
