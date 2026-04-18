@@ -11,7 +11,6 @@ jobs:
     if: github.event_name == 'pull_request'
     permissions:
       contents: read
-      pull-requests: write
 
     steps:
       - name: Checkout
@@ -31,7 +30,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Secret scan
+      - name: Secret scan (pull request range)
+        if: github.event_name == 'pull_request'
         uses: gitleaks/gitleaks-action@v2
         with:
-          args: detect --source . --redact --no-banner --verbose
+          args: detect --source . --redact --no-banner --verbose --log-opts="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
+      - name: Secret scan (push range)
+        if: github.event_name == 'push'
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --source . --redact --no-banner --verbose --log-opts="${{ github.event.before }}..${{ github.sha }}"
