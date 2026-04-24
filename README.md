@@ -273,6 +273,42 @@ Security policy:
 
 - SECURITY.md
 
+## Developer deep-dive
+
+### Internal architecture
+
+Core modules:
+
+- `src/index.ts`: SDK orchestration (`connect`, `useFolder`, file ops, subscriptions)
+- `src/google.ts` and `src/onedrive.ts`: provider adapters implementing `ProviderAdapter`
+- `src/metadata.ts`: `metadata.json` lifecycle, indexes, and conflict-aware commits
+- `src/cache.ts`: in-memory and SQLite cache implementations
+- `src/retry.ts`: retry/backoff/jitter and transient failure classification
+- `src/sql-mapper.ts`: table abstraction, index files, schema import, namespace support
+- `src/errors.ts`: typed error model
+
+### Runtime data model
+
+- Dataset = one cloud folder
+- Record = one file
+- Metadata index = `metadata.json`
+- SQL mapper table layout = `<namespace?>/<table>/_schema.json`, `<namespace?>/<table>/_index.json`, and record JSON files
+
+### Request flow
+
+1. `connect(provider, credentials, options)` initializes a provider adapter.
+2. `useFolder(folderIdOrLink)` resolves and binds the active dataset folder.
+3. `getFiles(filters)` combines provider file listing + metadata filtering.
+4. Metadata writes (`addMetadata`, `updateMetadata`, `removeMetadata`) are conflict-aware and indexed.
+5. `subscribe()` polls provider incremental APIs and reconciles metadata/cache.
+
+### Production integration notes
+
+- Treat FileBaseDB as a file-centric data layer, not a full transactional database.
+- Use app-level idempotency and contention handling for hot records.
+- Consume telemetry events (`retry`, `conflict`, `throttle`) for observability.
+- Keep OAuth secrets out of logs and source control; provider scopes are your effective permission boundary.
+
 ## Developer documentation
 
 - DEVELOPER_MANUAL.md
