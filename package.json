@@ -1,0 +1,75 @@
+{
+  "name": "filebasedb",
+  "version": "0.1.0",
+  "description": "Treat Google Drive or OneDrive folders as lightweight, metadata-driven databases.",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "DEVELOPER_MANUAL.md",
+    "FILEBASEDB_OVERVIEW.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "PUBLISHING_CHECKLIST.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"const fs=require('node:fs');if(fs.existsSync('dist'))fs.rmSync('dist',{recursive:true,force:true});\"",
+    "test": "npm run clean && npm run build && node --test dist/tests/*.test.js",
+    "test:smoke": "npm run clean && npm run build && node --test dist/tests/integration.smoke.test.js",
+    "dev": "ts-node examples/demo.ts",
+    "cli": "ts-node src/cli.ts",
+    "prepare": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PLMatlhape/FileBaseDB.git"
+  },
+  "keywords": [
+    "google-drive",
+    "onedrive",
+    "metadata",
+    "database",
+    "typescript"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/PLMatlhape/FileBaseDB/issues"
+  },
+  "homepage": "https://github.com/PLMatlhape/FileBaseDB#readme",
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "@types/sqlite3": "^5.1.0",
+    "picomatch": "^4.0.4",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  },
+  "dependencies": {
+    "@microsoft/microsoft-graph-client": "^3.0.7",
+    "dotenv": "^17.4.2",
+    "googleapis": "^171.4.0",
+    "isomorphic-fetch": "^3.0.0",
+    "sqlite3": "^6.0.1"
+  },
+  "bin": {
+    "filebasedb": "dist/src/cli.js"
+  }
+}
